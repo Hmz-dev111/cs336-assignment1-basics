@@ -106,4 +106,3 @@ if __name__ == "__main__":
     results_filename = "pretokenization_counts.pkl"
     with open(results_filename, "wb")as f:
         pickle.dump(total_counts,f)
-
