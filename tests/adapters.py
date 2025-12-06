@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Iterable
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from cs336_basics.get_tokenizer import Tokenizer
+from cs336_basics.Linear import Linear
+from cs336_basics.embedding import Ebedding
+from cs336_basics.rmsnorm import Rmsnorm
+from cs336_basics.swiglu import SwiGLU
+from cs336_basics.RoPE import RoPE
+from cs336_basics.multiheadattention import MultiHeadAttention
+from cs336_basics.transformer_block import TransformerBlock
+from cs336_basics.transformer_lm import transformer_lm
+from cs336_basics.AdamW import AdamW
+import torch.nn as nn
+import math
+import numpy as np
 
 
 def run_linear(
@@ -15,7 +28,7 @@ def run_linear(
     d_out: int,
     weights: Float[Tensor, " d_out d_in"],
     in_features: Float[Tensor, " ... d_in"],
-) -> Float[Tensor, " ... d_out"]:
+) -> Linear:
     """
     Given the weights of a Linear layer, compute the transformation of a batched input.
 
@@ -29,7 +42,11 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    linear = Linear(d_in, d_out)
+    with torch.inference_mode():
+        linear.weight = nn.Parameter(weights.T)
+
+    return linear(in_features)
 
 
 def run_embedding(
@@ -37,7 +54,7 @@ def run_embedding(
     d_model: int,
     weights: Float[Tensor, " vocab_size d_model"],
     token_ids: Int[Tensor, " ..."],
-) -> Float[Tensor, " ... d_model"]:
+) -> Ebedding:
     """
     Given the weights of an Embedding layer, get the embeddings for a batch of token ids.
 
@@ -51,7 +68,11 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    Ebedding_layer = Ebedding(vocab_size, d_model)
+    with torch.inference_mode():
+        Ebedding_layer.weight = nn.Parameter(weights)
+
+    return Ebedding_layer(token_ids)
 
 
 def run_swiglu(
@@ -61,7 +82,7 @@ def run_swiglu(
     w2_weight: Float[Tensor, " d_model d_ff"],
     w3_weight: Float[Tensor, " d_ff d_model"],
     in_features: Float[Tensor, " ... d_model"],
-) -> Float[Tensor, " ... d_model"]:
+) -> SwiGLU:
     """Given the weights of a SwiGLU network, return
     the output of your implementation with these weights.
 
@@ -83,7 +104,14 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    SwiGLU_layer = SwiGLU(d_model, d_ff)
+    with torch.inference_mode():
+        SwiGLU_layer.w_gate.weight = nn.Parameter(w1_weight.T)
+        SwiGLU_layer.w_in.weight = nn.Parameter(w3_weight.T)
+        SwiGLU_layer.w_out.weight = nn.Parameter(w2_weight.T)
+
+    return SwiGLU_layer(in_features)
+    
 
 
 def run_scaled_dot_product_attention(
@@ -104,7 +132,22 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    # get d_k
+    d_k = Q.shape[-1]
+    # compute raw attention scores
+    scores = torch.matmul(Q, K.transpose(-1, -2))
+    # scale scores
+    scores = scores / torch.sqrt(torch.tensor(d_k, dtype=scores.dtype))
+
+    # apply mask
+    if mask is not None:
+        scores = scores.masked_fill(mask == False, -float('inf'))
+
+    # compute softmax
+    attn_probs = run_softmax(scores, dim=-1)
+
+    attn_output = torch.matmul(attn_probs, V)
+    return attn_output
 
 
 def run_multihead_self_attention(
@@ -115,7 +158,7 @@ def run_multihead_self_attention(
     v_proj_weight: Float[Tensor, " d_v d_in"],
     o_proj_weight: Float[Tensor, " d_model d_v"],
     in_features: Float[Tensor, " ... sequence_length d_in"],
-) -> Float[Tensor, " ... sequence_length d_out"]:
+) -> MultiHeadAttention:
     """
     Given the key, query, and value projection weights of a naive unbatched
     implementation of multi-head attention, return the output of an optimized batched
@@ -138,8 +181,14 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    MultiHeadAttention_layer = MultiHeadAttention(d_model, num_heads,max_seq_len= in_features.shape[-2], device=in_features.device, dtype=in_features.dtype)
 
+    with torch.inference_mode():
+        MultiHeadAttention_layer.w_q.weight = nn.Parameter(q_proj_weight.T)
+        MultiHeadAttention_layer.w_k.weight = nn.Parameter(k_proj_weight.T)
+        MultiHeadAttention_layer.w_v.weight = nn.Parameter(v_proj_weight.T)
+        MultiHeadAttention_layer.w_o.weight = nn.Parameter(o_proj_weight.T)
+    return MultiHeadAttention_layer(in_features, token_positions=None)
 
 def run_multihead_self_attention_with_rope(
     d_model: int,
@@ -152,7 +201,7 @@ def run_multihead_self_attention_with_rope(
     o_proj_weight: Float[Tensor, " d_model d_v"],
     in_features: Float[Tensor, " ... sequence_length d_in"],
     token_positions: Int[Tensor, " ... sequence_length"] | None = None,
-) -> Float[Tensor, " ... sequence_length d_out"]:
+) -> MultiHeadAttention:
     """
     Given the key, query, and value projection weights of a naive unbatched
     implementation of multi-head attention, return the output of an optimized batched
@@ -178,7 +227,13 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    MultiHeadAttention_layer = MultiHeadAttention(d_model, num_heads, max_seq_len=max_seq_len, theta=theta, device=in_features.device, dtype=in_features.dtype) 
+    with torch.inference_mode():
+        MultiHeadAttention_layer.w_q.weight = nn.Parameter(q_proj_weight.T)
+        MultiHeadAttention_layer.w_k.weight = nn.Parameter(k_proj_weight.T)
+        MultiHeadAttention_layer.w_v.weight = nn.Parameter(v_proj_weight.T)
+        MultiHeadAttention_layer.w_o.weight = nn.Parameter(o_proj_weight.T)
+    return MultiHeadAttention_layer(in_features, token_positions=token_positions)
 
 
 def run_rope(
@@ -187,7 +242,7 @@ def run_rope(
     max_seq_len: int,
     in_query_or_key: Float[Tensor, " ... sequence_length d_k"],
     token_positions: Int[Tensor, " ... sequence_length"],
-) -> Float[Tensor, " ... sequence_length d_k"]:
+) -> RoPE:
     """
     Run RoPE for a given input tensor.
 
@@ -200,7 +255,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    RoPE_layer = RoPE(theta, d_k, max_seq_len)
+    return RoPE_layer(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -211,7 +267,7 @@ def run_transformer_block(
     theta: float,
     weights: dict[str, Tensor],
     in_features: Float[Tensor, " batch sequence_length d_model"],
-) -> Float[Tensor, " batch sequence_length d_model"]:
+) -> TransformerBlock:
     """
     Given the weights of a pre-norm Transformer block and input features,
     return the output of running the Transformer block on the input features.
@@ -273,7 +329,25 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    seq_len = in_features.shape[1]
+    token_positions = torch.arange(seq_len, device=in_features.device)
+
+    transformer_block_layer = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta, device=in_features.device, dtype=in_features.dtype)
+    with torch.inference_mode():
+        transformer_block_layer.attn.w_q.weight = nn.Parameter(weights["attn.q_proj.weight"].T)
+        transformer_block_layer.attn.w_k.weight = nn.Parameter(weights["attn.k_proj.weight"].T)
+        transformer_block_layer.attn.w_v.weight = nn.Parameter(weights["attn.v_proj.weight"].T)
+        transformer_block_layer.attn.w_o.weight = nn.Parameter(weights["attn.output_proj.weight"].T)
+
+        transformer_block_layer.rms_norm1.weight = nn.Parameter(weights["ln1.weight"])
+
+        transformer_block_layer.ffn.w_gate.weight = nn.Parameter(weights["ffn.w1.weight"].T)
+        transformer_block_layer.ffn.w_in.weight = nn.Parameter(weights["ffn.w3.weight"].T)
+        transformer_block_layer.ffn.w_out.weight = nn.Parameter(weights["ffn.w2.weight"].T)
+        
+        transformer_block_layer.rms_norm2.weight = nn.Parameter(weights["ln2.weight"])
+
+    return transformer_block_layer(in_features, token_positions=token_positions)
 
 
 def run_transformer_lm(
@@ -355,15 +429,43 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer_lm_layer = transformer_lm(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta, device=in_indices.device, dtype=torch.float32)
+    with torch.inference_mode():
+        # embedding
+        transformer_lm_layer.token_embedding.weight = nn.Parameter(weights["token_embeddings.weight"])
 
+        # for every num_layers
+        for i in range(num_layers):
+            prefix = f"layers.{i}."
+            block = transformer_lm_layer.layers[i]
+
+            block.attn.w_q.weight = nn.Parameter(weights[f"{prefix}attn.q_proj.weight"].T)
+            block.attn.w_k.weight = nn.Parameter(weights[f"{prefix}attn.k_proj.weight"].T)
+            block.attn.w_v.weight = nn.Parameter(weights[f"{prefix}attn.v_proj.weight"].T)
+            block.attn.w_o.weight = nn.Parameter(weights[f"{prefix}attn.output_proj.weight"].T)
+
+            block.rms_norm1.weight = nn.Parameter(weights[f"{prefix}ln1.weight"])
+
+            block.ffn.w_gate.weight = nn.Parameter(weights[f"{prefix}ffn.w1.weight"].T)
+            block.ffn.w_in.weight = nn.Parameter(weights[f"{prefix}ffn.w3.weight"].T)
+            block.ffn.w_out.weight = nn.Parameter(weights[f"{prefix}ffn.w2.weight"].T)
+            
+            block.rms_norm2.weight = nn.Parameter(weights[f"{prefix}ln2.weight"])
+
+        # final norm
+        transformer_lm_layer.ln_f.weight = nn.Parameter(weights["ln_final.weight"])
+
+        # output(linear)
+        transformer_lm_layer.lm_head.weight = nn.Parameter(weights["lm_head.weight"].T)
+
+    return transformer_lm_layer(in_indices)
 
 def run_rmsnorm(
     d_model: int,
     eps: float,
     weights: Float[Tensor, " d_model"],
     in_features: Float[Tensor, " ... d_model"],
-) -> Float[Tensor, " ... d_model"]:
+) -> Rmsnorm:
     """Given the weights of a RMSNorm affine transform,
     return the output of running RMSNorm on the input features.
 
@@ -378,7 +480,11 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    Rmsnorm_layer = Rmsnorm(d_model, eps)
+    with torch.inference_mode():
+        Rmsnorm_layer.scale = nn.Parameter(weights)
+
+    return Rmsnorm_layer(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -395,28 +501,114 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     raise NotImplementedError
 
 
-def run_get_batch(
-    dataset: npt.NDArray, batch_size: int, context_length: int, device: str
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Given a dataset (a 1D numpy array of integers) and a desired batch size and
-    context length, sample language modeling input sequences and their corresponding
-    labels from the dataset.
+# def run_get_batch(
+#     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
+# ) -> tuple[torch.Tensor, torch.Tensor]:
+#     """
+#     Given a dataset (a 1D numpy array of integers) and a desired batch size and
+#     context length, sample language modeling input sequences and their corresponding
+#     labels from the dataset.
 
-    Args:
-        dataset (np.array): 1D numpy array of integer token IDs in the dataset.
-        batch_size (int): Desired batch size to sample.
-        context_length (int): Desired context length of each sampled example.
-        device (str): PyTorch device string (e.g., 'cpu' or 'cuda:0') indicating the device
-            to place the sampled input sequences and labels on.
+#     Args:
+#         dataset (np.array): 1D numpy array of integer token IDs in the dataset.
+#         batch_size (int): Desired batch size to sample.
+#         context_length (int): Desired context length of each sampled example.
+#         device (str): PyTorch device string (e.g., 'cpu' or 'cuda:0') indicating the device
+#             to place the sampled input sequences and labels on.
 
-    Returns:
-        Tuple of torch.LongTensors of shape (batch_size, context_length). The first tuple item
-        is the sampled input sequences, and the second tuple item is the corresponding
-        language modeling labels.
-    """
-    raise NotImplementedError
+#     Returns:
+#         Tuple of torch.LongTensors of shape (batch_size, context_length). The first tuple item
+#         is the sampled input sequences, and the second tuple item is the corresponding
+#         language modeling labels.
+#     """
+#     # product batch_size indices
+#     ix = torch.randint(low=0, high=len(dataset)-context_length, size=(batch_size,))
 
+#     # get data (input,x)
+#     # x = torch.stack([
+#     #     torch.from_numpy((dataset[i : i + context_length]).astype(np.int64))
+#     #     for i in ix
+#     # ])
+
+#     # # get target (target,y)
+#     # y = torch.stack([
+#     #     torch.from_numpy((dataset[i + 1 : i + 1 + context_length]).astype(np.int64))
+#     #     for i in ix
+#     # ])
+
+#     #   # device
+#     # if "cuda" in device:
+#     #     x = x.pin_memory().to(device, non_blocking=True)
+#     #     y = y.pin_memory().to(device, non_blocking=True)
+#     # else:
+#     #     x = x.to(device)
+#     #     y = y.to(device)
+
+#     # numpy
+#     # batch_x = []
+#     # batch_y = []
+#     # for i in ix:
+#     #     batch_x.append(dataset[i : i + context_length])
+#     #     batch_y.append(dataset[i + 1 : i + 1 + context_length])
+
+#     # x = torch.tensor(np.array(batch_x), dtype=torch.long).to(device)
+#     # y = torch.tensor(np.array(batch_y), dtype=torch.long).to(device)
+
+#     # return x,y
+
+#     indices = ix.view(-1, 1) + torch.arange(context_length + 1)
+#     indices = indices.numpy() # 转回 numpy 去切片
+    
+#     # 3. 一次性从 dataset 切片 (这里 dataset 必须在内存里，即 np.fromfile 读出来的)
+#     batch_data = dataset[indices] # 形状: [Batch, Context+1]
+    
+#     # 4. 转为 Tensor 并切分 x, y
+#     batch_tensor = torch.from_numpy(batch_data.astype(np.int64))
+    
+#     x = batch_tensor[:, :-1] # 前 context_length 个
+#     y = batch_tensor[:, 1:]  # 后 context_length 个
+#     # --- 优化结束 ---
+
+#     # 5. 搬运到 GPU
+#     if "cuda" in device:
+#         x = x.pin_memory().to(device, non_blocking=True)
+#         y = y.pin_memory().to(device, non_blocking=True)
+#     else:
+#         x = x.to(device)
+#         y = y.to(device)
+
+#     return x, y
+
+def run_get_batch(dataset, batch_size, context_length, device):
+    # 1. 随机生成起始位置
+    ix = torch.randint(low=0, high=len(dataset) - context_length, size=(batch_size,))
+    
+    # 2. ⚡️ 极速向量化切片 (无 for 循环)
+    # 利用广播机制一次性生成所有需要的索引矩阵 [Batch, Context+1]
+    # 这一步是在 CPU 上做的纯数学运算，极快
+    start_indices = ix.view(-1, 1)
+    offsets = torch.arange(context_length + 1)
+    indices = (start_indices + offsets).numpy()
+    
+    # 3. 一次性从内存抓取所有数据 (dataset 必须是 np.ndarray)
+    batch_data = dataset[indices] 
+    
+    # 4. 转为 Tensor
+    batch_tensor = torch.from_numpy(batch_data.astype(np.int64))
+    
+    # 5. 切分 x, y
+    x = batch_tensor[:, :-1]
+    y = batch_tensor[:, 1:]
+
+    # 6. 搬运到 GPU
+    if "cuda" in device:
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
+
+    return x, y
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     """
@@ -431,7 +623,10 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    x_max = in_features.max(dim=dim, keepdim=True).values
+    exp_x = torch.exp(in_features - x_max)
+    x_sum = torch.sum(exp_x, dim=dim, keepdim=True)
+    return exp_x / x_sum
 
 
 def run_cross_entropy(
@@ -449,7 +644,24 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    # compute log(sum(exp(x)))
+    # find max value
+    m = inputs.max(dim=-1, keepdim=True).values
+
+    # all value increase m
+    inputs_safe = inputs - m
+
+    # compute log_sum_exp
+    log_sum_exp = torch.log(torch.sum(torch.exp(inputs_safe), dim=-1)) + m.squeeze(-1)
+
+    # get target
+    batch_indices = torch.arange(inputs.shape[0],device=inputs.device)
+    true_logits = inputs[batch_indices, targets]
+
+    # comnpute loss
+    loss = log_sum_exp - true_logits
+
+    return loss.mean()
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -461,14 +673,36 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    eps = 1e-6
+    params = [p for  p in parameters if p.grad is not None]
+    
+    if len(params) == 0:
+        return
+    
+    # comput grads square sum
+    device = params[0].grad.device
+    total_norm_sq = torch.zeros([],device=device)
+
+    for p in params:
+        total_norm_sq += p.grad.detach().pow(2).sum()
+
+    # total num
+    total_norm = total_norm_sq.sqrt()
+
+    # clipping
+    if total_norm > max_l2_norm:
+        scale = max_l2_norm / (total_norm + eps)
+
+        for p in params:
+            p.grad.detach().mul_(scale)
 
 
-def get_adamw_cls() -> Any:
+
+def get_adamw_cls() -> AdamW:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -496,7 +730,22 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    # warm up progress
+    if it < warmup_iters:
+        return (it / warmup_iters) * max_learning_rate
+    
+    # post_annealing progress 
+    if it > cosine_cycle_iters:
+        return min_learning_rate
+    
+    # Cosine annealing 
+    progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+
+    # cosine format
+    cos_term = math.cos(progress * math.pi)
+
+    # min + 0.5 * (1 + cos_term) * (max - min)
+    return min_learning_rate + 0.5 * (1 + cos_term) * (max_learning_rate - min_learning_rate)
 
 
 def run_save_checkpoint(
@@ -515,7 +764,15 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    # dict
+    checkpoint_state = {
+        "model_state_dict" : model.state_dict(),
+        "optimizer_state_dict" : optimizer.state_dict(),
+        "iteration" : iteration
+    }
+    
+    # torch save
+    torch.save(checkpoint_state, out)
 
 
 def run_load_checkpoint(
@@ -536,14 +793,24 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    # load checkpoint
+    checkpoint_state = torch.load(src, map_location = "cpu")
+    
+    # recover param
+    model.load_state_dict(checkpoint_state["model_state_dict"])
+
+    # recover op state
+    optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
+
+    # return step
+    return checkpoint_state["iteration"]
 
 
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
     special_tokens: list[str] | None = None,
-) -> Any:
+) -> Tokenizer:
     """Given a vocabulary, a list of merges, and a list of special tokens,
     return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
 
@@ -559,7 +826,30 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(
+        vocab=vocab,
+        merges=merges,
+        special_tokens=special_tokens,
+    )
+
+def merge_pair(
+    word: tuple[bytes, ...], 
+    pair: tuple[bytes, bytes], 
+    new_token: bytes
+) -> tuple[bytes, ...]:
+    new_word = []
+    i =0
+    while i < len(word):
+        # check if merge pair
+        if i < len(word) - 1 and word[i] == pair[0] and word[i+1] == pair[1]:
+            new_word.append(new_token)
+            # skip two addresses
+            i += 2
+        else:
+            new_word.append(word[i])
+            # skip one address
+            i += 1
+    return tuple(new_word)
 
 
 def run_train_bpe(
@@ -589,4 +879,99 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    from collections import Counter, defaultdict
+    import regex as re
+    import heapq
+
+    # Read file
+    with open(input_path, 'r', encoding='utf-8')as f:
+        text = f.read()
+    
+    # Initial vocab
+    # 256 bytes
+    vocab  = {}
+    for i in range(256):
+        vocab[i] = bytes([i])
+
+    # add special_tokens
+    for special_token in special_tokens:
+        if special_token.encode('utf-8') not in vocab.values():
+            vocab[len(vocab)] = special_token.encode('utf-8')
+
+    # pretokenize
+    pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+    # split text by special tokens
+    if special_tokens:
+        special_pattern = '|'.join(re.escape(token) for token in sorted(special_tokens, key=len, reverse=True))
+        text_parts = re.split(f'({special_pattern})', text)
+    else:
+        text_parts = [text]
+    
+    # get word counts
+    word_counts = Counter()
+    for part in text_parts:
+        if part in special_tokens:
+            word_counts[tuple([part.encode('utf-8')])] += 1
+        elif part:
+            tokens = re.findall(pat, part)
+            for token in tokens:
+                token_bytes = token.encode('utf-8')
+                word_counts[tuple(bytes([b]) for b in token_bytes)] += 1
+
+    # BPE training
+    merges = []
+
+    # set of special token bytes
+    special_token_bytes = {st.encode('utf-8') for st in special_tokens}
+
+    while len(vocab) < vocab_size:
+        # Count all pairs
+        pair_counts = Counter()
+        
+        for word, count in word_counts.items():
+            # Skip special tokens (single-element tuples containing special token bytes)
+            if len(word) == 1 and word[0] in special_token_bytes:
+                continue
+            
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                pair_counts[pair] += count
+        
+        if not pair_counts:
+            break
+        
+        # Find best pair: max count, with lexicographic tiebreaker
+        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        
+        # Merge new best pair and add to vocab
+        new_token = best_pair[0] + best_pair[1]
+        vocab[len(vocab)] = new_token
+        merges.append(best_pair)
+        
+        # Update word_counts
+        new_word_counts = Counter()
+        
+        for word, count in word_counts.items():
+            # Skip special tokens
+            if len(word) == 1 and word[0] in special_token_bytes:
+                new_word_counts[word] += count
+                continue
+            
+            # Check if word contains best_pair
+            has_best_pair = False
+            for i in range(len(word) - 1):
+                if word[i] == best_pair[0] and word[i + 1] == best_pair[1]:
+                    has_best_pair = True
+                    break
+            
+            if has_best_pair:
+                # Merge the pair in this word
+                new_word = merge_pair(word, best_pair, new_token)
+                new_word_counts[new_word] += count
+            else:
+                new_word_counts[word] += count
+        
+        word_counts = new_word_counts
+
+    return vocab, merges
